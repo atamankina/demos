@@ -5,7 +5,7 @@ yum install -y httpd
 wget https://raw.githubusercontent.com/atamankina/demos/main/elb_demo/elb_demo_target1.html
 sed -e "s/\${host}/$(hostname -f)/" \
 	-e "s/\${AZ}/$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)/" \
-	elb_demo.html > /var/www/html/target1.html
+	elb_demo_target1 > /var/www/html/target1.html
 # Turn on web server
 chkconfig httpd on
 service httpd start
