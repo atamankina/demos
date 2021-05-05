@@ -1,0 +1,412 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Federated Authentication with AD FS
+
+Parameters:
+  AdministratorPassword:
+    Type: String
+
+  WindowsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+
+  DomainDNSName:
+    Type: String
+    Description: DNS Domain for the AD (example.com)
+    Default: mydomain.local
+
+  DomainControllerPrivateIp:
+    Type: String
+    Description: Fixed private IP for the Domain Controller located in AZ1.
+    Default: 10.0.0.10
+
+  ADFSPrivateIp:
+    Type: String
+    Description: Fixed private IP for the AD FS server located in AZ1.
+    Default: 10.0.0.15
+
+Resources:
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NatElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: !Ref LabVPC
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatElasticIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.32.0/20
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+      Tags:
+        - Key: Name
+          Value: Public Subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.0.0/19
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+      Tags:
+        - Key: Name
+          Value: Private Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: PublicSubnet
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: PrivateSubnet
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Network
+          Value: Private Route Table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PublicRoute
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PrivateRoute
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+      Policies:
+        - PolicyName: EC2RolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - ec2:DescribeInstances
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                Effect: Allow
+                Resource: "*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  AllTrafficSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable All Inbound Traffic
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: AllTrafficSecurityGroup
+
+  DomainController:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    DependsOn:
+      - PrivateSubnetRouteTableAssociation
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            1-Change-Password:
+              command: !Sub net user Administrator "${AdministratorPassword}"
+              waitAfterCompletion: 0
+            2-Rename-Computer:
+              command: powershell.exe -Command "Rename-Computer -NewName DC1 -Restart"
+              waitAfterCompletion: forever
+            2-Install-Domain-Controller:
+              command: !Sub powershell.exe -Command Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools; Import-Module ADDSDeployment; Install-ADDSForest -DomainName '${DomainDNSName}' -DomainMode Win2008R2 -ForestMode Win2008R2 -SafeModeAdministratorPassword (ConvertTo-SecureString -String \"${AdministratorPassword}\" -AsPlainText -Force) -Force
+              waitAfterCompletion: forever
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: !Ref WindowsAmiId
+      InstanceType: m5.large
+      PrivateIpAddress: !Ref DomainControllerPrivateIp
+      SecurityGroupIds:
+        - !Ref AllTrafficSecurityGroup
+      SubnetId: !Ref PrivateSubnet
+      Tags:
+        - Key: Name
+          Value: DC
+      UserData:
+        Fn::Base64: !Sub |
+          <script>
+            cfn-init.exe -v --stack ${AWS::StackName} --region ${AWS::Region} --resource DomainController
+            cfn-signal.exe --stack ${AWS::StackName} --region ${AWS::Region} --resource DomainController --exit-code %ERRORLEVEL%
+          </script>
+
+  ADFS:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    DependsOn:
+      - PrivateSubnetRouteTableAssociation
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            1-Change-Password:
+              command: !Sub net user Administrator "${AdministratorPassword}"
+              waitAfterCompletion: 0
+            2-Install-Chocolatey:
+              command: powershell.exe -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))"
+              waitAfterCompletion: 0
+            3-Install-Chrome:
+              command: C:\ProgramData\chocolatey\bin\choco.exe install googlechrome --yes --no-progress --ignore-checksums
+              waitAfterCompletion: 0
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: !Ref WindowsAmiId
+      InstanceType: m5.large
+      PrivateIpAddress: !Ref ADFSPrivateIp
+      SecurityGroupIds:
+        - !Ref AllTrafficSecurityGroup
+      SubnetId: !Ref PrivateSubnet
+      Tags:
+        - Key: Name
+          Value: ADFS
+      UserData:
+        Fn::Base64: !Sub |
+          <script>
+            cfn-init.exe -v --stack ${AWS::StackName} --region ${AWS::Region} --resource ADFS
+            cfn-signal.exe --stack ${AWS::StackName} --region ${AWS::Region} --resource ADFS --exit-code %ERRORLEVEL%
+          </script>
+
+  RDGWSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for the RDGW Server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref LabVPC
+
+  RDGW:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    DependsOn:
+      - DomainController
+      - PublicSubnetRouteTableAssociation
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            1-Change-Password:
+              command: !Sub net user Administrator "${AdministratorPassword}"
+              waitAfterCompletion: 0
+            2-Rename-Computer:
+              command: powershell.exe -Command "Rename-Computer -NewName RDGW"
+              waitAfterCompletion: 0
+            3-Set-DNS-Address:
+              command: !Sub powershell.exe -Command "Get-NetAdapter | Set-DnsClientServerAddress -ServerAddress '${DomainControllerPrivateIp}'"
+              waitAfterCompletion: 0
+            4-Join-Directory:
+              command: !Sub powershell.exe -Command do { Start-Sleep 10; Add-Computer -DomainName '${DomainDNSName}' -Credential (New-Object PSCredential('Administrator', (ConvertTo-SecureString -String \"${AdministratorPassword}\" -AsPlainText -Force))) -Restart } while (!$?)
+              waitAfterCompletion: forever
+            5-Disable-Firewall:
+              command: powershell.exe -Command "Set-NetFirewallProfile -Profile Private -Enabled False"
+              waitAfterCompletion: 0
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: !Ref WindowsAmiId
+      InstanceType: m5.large
+      SecurityGroupIds:
+        - !Ref RDGWSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: RDGW
+      UserData:
+        Fn::Base64: !Sub |
+          <script>
+            cfn-init.exe -v --stack ${AWS::StackName} --region ${AWS::Region} --resource RDGW
+            cfn-signal.exe --stack ${AWS::StackName} --region ${AWS::Region} --resource RDGW --exit-code %ERRORLEVEL%
+          </script>
+
+  ADFSViewEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-View-EC2
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRoleWithSAML
+            Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/ADFS
+            Condition:
+              StringEquals:
+                SAML:aud: https://signin.aws.amazon.com/saml
+      Policies:
+        - PolicyName: adfs-role
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - ec2:Get*
+                  - ec2:Describe*
+                  - ec2:List*
+                Effect: Allow
+                Resource: "*"
+              - Action:
+                  - ec2:RunInstances
+                  - ec2:StartInstances
+                Effect: Deny
+                Resource: arn:aws:ec2:*:*:instance/*
+              - Action:
+                  - ec2:*Spot*
+                Effect: Deny
+                Resource: "*"
+
+  ADFSViewS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-View-S3
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRoleWithSAML
+            Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/ADFS
+            Condition:
+              StringEquals:
+                SAML:aud: https://signin.aws.amazon.com/saml
+      Policies:
+        - PolicyName: adfs-role
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - s3:Get*
+                  - s3:Describe*
+                  - s3:List*
+                Effect: Allow
+                Resource: "*"
+
+  ReadOnlyGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: QLReadOnly
+      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/ReadOnlyAccess" ]
+  GroupAssignment:
+    Type: AWS::IAM::UserToGroupAddition
+    DependsOn: ReadOnlyGroup
+    Properties:
+      GroupName: QLReadOnly
+      Users:
+        - awsstudent
+
+  ADFSBucket:
+    Type: AWS::S3::Bucket
+
+Outputs:
+  AdministratorPassword:
+    Value: !Ref AdministratorPassword
+
+  ADFSPrivateIp:
+    Value: !Ref ADFSPrivateIp
+
+  ADFSViewEC2Role:
+    Value: !GetAtt ADFSViewEC2Role.Arn
+
+  ADFSViewS3Role:
+    Value: !GetAtt ADFSViewS3Role.Arn
+
+  DomainControllerPrivateIP:
+    Value: !Ref DomainControllerPrivateIp
+
+  RDGWPublicIP:
+    Value: !GetAtt RDGW.PublicIp
+
+  Region:
+    Value: !Ref AWS::Region

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Install Apache Web Server and PHP
+yum update -y
 yum install -y httpd
 # Download and adjust the html file
 wget https://raw.githubusercontent.com/atamankina/demos/main/elb_demo/elb_demo_target2.html
